@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+*.sqlite*
+*.db
+*.log
+*.key
+*.pem
+*.zip
+.DS_Store
+._*
+secrets/
+backups/
