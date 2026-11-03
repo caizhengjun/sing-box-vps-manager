@@ -32,7 +32,7 @@ async def handle(request):
     if request.path.startswith('/admin/') and not row.get('is_admin'):
         return web.Response(status=404)
     fmt=request.query.get('format','base64')
-    if fmt not in ('singbox','mihomo','links','base64'):return web.Response(status=400)
+    if fmt not in ('singbox','karing','mihomo','links','base64'):return web.Response(status=400)
     outs=row['outs']
     body,media=render(outs,fmt) if outs else ('套餐暂无可用节点\n','text/plain')
     headers={'X-Subscription-Start':str(row['started']),

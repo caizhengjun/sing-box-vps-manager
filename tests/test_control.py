@@ -87,6 +87,13 @@ class ControlTests(unittest.TestCase):
   with mock.patch.object(ctl,'ask',side_effect=lambda *a,**k:next(answers)),mock.patch.object(ctl,'reconcile'):
    ctl.edit_node(self.db,ctl.node(self.db,self.nid))
   self.assertIsNone(ctl.node(self.db,self.nid)['revision'])
+ def test_client_profiles_split_compatibility_and_full(self):
+  outs=[{'type':kind,'tag':kind} for kind in ('vless','trojan','hysteria2','tuic','shadowsocks','anytls','naive')]
+  portable=json.loads(formats.render(outs,'singbox')[0])
+  full=json.loads(formats.render(outs,'karing')[0])
+  self.assertEqual([o['type'] for o in portable['outbounds'][1:]],['vless','trojan','hysteria2','tuic','shadowsocks'])
+  self.assertEqual(full['outbounds'][1:],outs)
+  self.assertEqual(full['outbounds'][0]['outbounds'],[o['tag'] for o in outs])
  def test_human_readable_user_details_and_assigned_node(self):
   self.assertEqual(ctl.human_bytes(341944499),'326.10 MB')
   self.assertEqual(ctl.human_bytes(2*1024**3),'2.00 GB')

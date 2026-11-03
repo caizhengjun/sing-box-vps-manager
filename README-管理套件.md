@@ -69,7 +69,7 @@ sudo /opt/sb-manager/manage.sh
 
 数据库位于 `/var/lib/sb-manager/manager.sqlite`，只能由 root 读取；订阅服务只读取去除明文令牌的发布快照。普通用户路径为 `/sub/<令牌>`，管理员路径为 `/admin/<令牌>`，格式包括 `singbox`、`mihomo`、`base64` 和 `links`。
 
-主 `singbox` 订阅为兼容常见客户端会省略 Naive 出站。服务端仍提供 Naive H2/H3，基础安装会生成 `naive-client-h2.json` 和 `naive-client-h3.json`；只有明确支持 Naive outbound 的客户端才能使用。Mihomo 和通用链接也不输出 Naive。
+`format=singbox` 是兼容版，只输出 VLESS（REALITY/WS）、Trojan、Hysteria2、TUIC 和 SS2022，不输出 AnyTLS、Naive。`format=karing` 是全量版，输出所有已授权协议，包括 AnyTLS 和 Naive H2/H3；能否运行仍取决于客户端版本和构建能力，不保证所有旧版 Karing 都支持。两种格式均可生成独立二维码。Mihomo 和通用链接不输出 Naive。
 
 管理器约每 30 秒同步流量和授权，不承诺字节级硬限额；断线或异常退出附近可能有少量遗漏。停用或删除用户会撤销协议凭据，只更换订阅令牌不会撤销客户端已取得的旧凭据。
 

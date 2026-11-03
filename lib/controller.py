@@ -391,7 +391,7 @@ def user_cmd(d,args):
         print_user(d,u)
         base=subscription_base(d,u)
         print('订阅：')
-        for fmt in ('singbox','mihomo','base64','links'):print(fmt,base+'?format='+fmt)
+        for fmt in ('singbox','karing','mihomo','base64','links'):print(fmt,base+'?format='+fmt)
     elif args.action=='renew':
         if u['is_admin']:raise Error('管理员订阅无需续费。')
         p=plan(d,u['plan_id']);amount=ask('已收款金额及货币');note=ask('付款备注','手动收款')
@@ -409,7 +409,7 @@ def user_cmd(d,args):
         with d:d.execute('UPDATE users SET token=? WHERE id=?',(secrets.token_urlsafe(48 if u['is_admin'] else 32),u['id']))
         publish(d)
     elif args.action=='qr':
-        if args.format not in ('singbox','mihomo','base64','links'):raise Error('二维码订阅格式无效。')
+        if args.format not in ('singbox','karing','mihomo','base64','links'):raise Error('二维码订阅格式无效。')
         base=subscription_base(d,u)+'?format='+args.format
         print('\n紧凑二维码（请扩大终端窗口后扫描）：')
         subprocess.run(['qrencode','-t','UTF8','-m','1'],input=base.encode(),check=True)
@@ -446,7 +446,7 @@ def menu():
         needs_id=action not in ('list','add','add-admin')
         item=ask('节点 ID' if kind=='node' else '套餐/用户 ID 或名称') if needs_id else None
         a=argparse.Namespace(action=action,id=item,format='singbox',output=None)
-        if action=='qr':a.format=ask('订阅格式 singbox/mihomo/base64/links','singbox')
+        if action=='qr':a.format=ask('订阅格式 singbox（兼容）/karing（全量）/mihomo/base64/links','singbox')
         try:
             with lock(HOME/'lock'):
                 d=database()
@@ -467,7 +467,7 @@ def main():
             q=a.add_parser(act)
             if act in ('show','edit','sync','disable','enable','delete','renew','rotate-token','qr','sni'):q.add_argument('id')
             if act=='sni':q.add_argument('sni')
-            if act=='qr':q.add_argument('--format',choices=['singbox','mihomo','base64','links'],default='singbox');q.add_argument('--output')
+            if act=='qr':q.add_argument('--format',choices=['singbox','karing','mihomo','base64','links'],default='singbox');q.add_argument('--output')
     sub.add_parser('reconcile');setup=sub.add_parser('setup');setup.add_argument('--domain',required=True)
     args=parser.parse_args()
     if args.kind is None:

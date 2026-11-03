@@ -107,8 +107,10 @@ def render(outs, fmt):
     # unsupported TLS flags. Keep the primary profile portable; Naive remains
     # available as a separately verified service for clients that ship it.
     if fmt=='singbox':
-        portable=[o for o in outs if o['type']!='naive']
+        portable=[o for o in outs if o['type'] in ('vless','trojan','hysteria2','tuic','shadowsocks')]
         return json.dumps(singbox(portable),ensure_ascii=False,indent=2)+'\n','application/json'
+    if fmt=='karing':
+        return json.dumps(singbox(outs),ensure_ascii=False,indent=2)+'\n','application/json'
     if fmt=='mihomo':
         # JSON is a valid YAML 1.2 document and accepted by Mihomo, no PyYAML dependency.
         return json.dumps(mihomo(outs),ensure_ascii=False,indent=2)+'\n','application/yaml'
