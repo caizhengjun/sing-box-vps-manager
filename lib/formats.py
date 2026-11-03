@@ -50,10 +50,12 @@ def singbox(outs, gui=False):
         config['inbounds'] = [{'type':'tun','tag':'tun-in','address':['172.19.0.1/30'],
                                'mtu':1500,'auto_route':True,'stack':'gvisor'}]
         config['dns'] = {'servers':[
-            {'type':'udp','tag':'bootstrap','server':'223.5.5.5'},
-            {'type':'https','tag':'remote','server':'1.1.1.1','path':'/dns-query','detour':'套餐节点'}],
+            {'tag':'bootstrap','address':'223.5.5.5','detour':'direct'},
+            {'tag':'remote','address':'https://1.1.1.1/dns-query','detour':'套餐节点'}],
+            'rules':[{'outbound':'any','server':'bootstrap'}],
             'final':'remote','strategy':'ipv4_only'}
-        config['route'].update(auto_detect_interface=True,default_domain_resolver='bootstrap',
+        config['outbounds'].append({'type':'direct','tag':'direct'})
+        config['route'].update(auto_detect_interface=True,
             rules=[{'port':53,'action':'hijack-dns'}])
     return config
 

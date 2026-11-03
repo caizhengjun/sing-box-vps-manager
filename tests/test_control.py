@@ -80,7 +80,7 @@ class ControlTests(unittest.TestCase):
   outs=[{'type':'naive','tag':'Naive','server':'x','server_port':1},
         {'type':'trojan','tag':'Trojan','server':'x','server_port':2,'password':'p','tls':{'enabled':True,'server_name':'x'}}]
   body,_=formats.render(outs,'singbox');cfg=json.loads(body)
-  self.assertEqual([o['type'] for o in cfg['outbounds'][1:]],['trojan'])
+  self.assertEqual([o['type'] for o in cfg['outbounds'][1:]],['trojan','direct'])
  def test_node_rename_invalidates_revision(self):
   with self.db:self.db.execute('UPDATE nodes SET revision=? WHERE id=?',('old',self.nid))
   answers=iter(['🇺🇸 US-LA','香港,基础'])
@@ -91,14 +91,15 @@ class ControlTests(unittest.TestCase):
   outs=[{'type':kind,'tag':kind} for kind in ('vless','trojan','hysteria2','tuic','shadowsocks','anytls','naive')]
   portable=json.loads(formats.render(outs,'singbox')[0])
   full=json.loads(formats.render(outs,'karing')[0])
-  self.assertEqual([o['type'] for o in portable['outbounds'][1:]],['vless','trojan','hysteria2','tuic','shadowsocks'])
+  self.assertEqual([o['type'] for o in portable['outbounds'][1:]],['vless','trojan','hysteria2','tuic','shadowsocks','direct'])
   self.assertEqual(full['outbounds'][1:],outs)
   self.assertEqual(full['outbounds'][0]['outbounds'],[o['tag'] for o in outs])
   self.assertEqual(portable['inbounds'][0]['type'],'tun')
   self.assertTrue(portable['inbounds'][0]['auto_route'])
   self.assertEqual(portable['log']['level'],'info')
   self.assertEqual(portable['dns']['final'],'remote')
-  self.assertEqual(portable['route']['default_domain_resolver'],'bootstrap')
+  self.assertNotIn('default_domain_resolver',portable['route'])
+  self.assertEqual(portable['dns']['rules'][0],{'outbound':'any','server':'bootstrap'})
   self.assertEqual(full['inbounds'][0]['type'],'mixed')
  def test_human_readable_user_details_and_assigned_node(self):
   self.assertEqual(ctl.human_bytes(341944499),'326.10 MB')
