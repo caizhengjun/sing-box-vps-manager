@@ -33,6 +33,18 @@ JOBS = queue.Queue(maxsize=30)
 PROBES = {}
 PROBE_LOCK = threading.Lock()
 FORMATS = ('singbox', 'karing', 'mihomo', 'links', 'base64')
+def pending_dir(): return BASE/'pending-nodes'
+
+def pending_nodes():
+    pdir=pending_dir()
+    try:pdir.mkdir(mode=0o700,parents=True,exist_ok=True); os.chmod(pdir,0o700)
+    except OSError:return []
+    out=[]
+    for f in pdir.glob('*.json'):
+        try:
+            x=json.loads(f.read_text()); out.append({k:x.get(k) for k in ('id','domain','ssh_user','host','created')})
+        except Exception: pass
+    return out
 
 def database():
     BASE.mkdir(parents=True, mode=0o700, exist_ok=True)
@@ -43,12 +55,22 @@ def database():
         updated INTEGER,state TEXT,step TEXT,error TEXT);
       CREATE TABLE IF NOT EXISTS audit(id TEXT PRIMARY KEY,actor TEXT,action TEXT,target TEXT,created INTEGER);
     ''')
+    try:d.execute('ALTER TABLE tasks ADD COLUMN stages TEXT NOT NULL DEFAULT "[]"')
+    except sqlite3.OperationalError:pass
     return d
 
 def progress(task, step, state='running', error=''):
+    labels=['连接服务器','验证密码和主机指纹','清理上次初始化残留','配置管理密钥','安装依赖、代理程序与证书','上传节点管理程序','检查并接管已有的兼容部署','构建并验证逐用户流量统计','同步用户授权并发布订阅']
+    match=next((x for x in labels if x in step),None)
     with database() as d:
-        d.execute('UPDATE tasks SET step=?,state=?,updated=?,error=? WHERE id=?',
-                  (step,state,now(),error,task))
+        row=d.execute('SELECT stages FROM tasks WHERE id=?',(task,)).fetchone()
+        stages=json.loads(row[0] or '[]') if row else []
+        if not stages:stages=[{'name':x,'state':'pending'} for x in labels]
+        if match:
+            for x in stages:
+                if x['name']==match:x['state']='failed' if state=='failed' else 'running' if state=='running' else 'done'
+        d.execute('UPDATE tasks SET step=?,state=?,updated=?,error=?,stages=? WHERE id=?',
+                  (step,state,now(),error,json.dumps(stages,ensure_ascii=False),task))
 
 def safe_actor(value):
     return label(str(value))
@@ -67,12 +89,39 @@ def snapshot():
             p['node_ids']=[r[0] for r in d.execute('SELECT node_id FROM plan_nodes WHERE plan_id=?',(p['id'],))]
             p['matched_node_ids']=[n['id'] for n in nodes if (n['id'] in p['node_ids'] if p['access_mode']=='selected'
                                    else bool(set(json.loads(n['tags'])) & set(json.loads(p['tags']))))]
+        node_meta={r['id']:dict(r) for r in d.execute('SELECT id,name,state,last_sample FROM nodes')}
+        usage={};usage_index={}
+        for r in d.execute('''SELECT substr(principal,3,32) AS user_id,node_id,
+                              SUM(up) AS up,SUM(down) AS down FROM samples
+                              GROUP BY substr(principal,3,32),node_id'''):
+            n=node_meta.get(r['node_id'],{})
+            entry={'node_id':r['node_id'],
+                'name':n.get('name','历史节点'),'state':n.get('state','deleted'),
+                'up':r['up'] or 0,'down':r['down'] or 0,'sample_at':n.get('last_sample'),
+                'protocols':[]}
+            usage.setdefault(r['user_id'],[]).append(entry)
+            usage_index[(r['user_id'],r['node_id'])]=entry
+        for r in d.execute('''SELECT substr(principal,3,32) AS user_id,node_id,protocol,
+                              SUM(up) AS up,SUM(down) AS down FROM protocol_samples
+                              GROUP BY substr(principal,3,32),node_id,protocol'''):
+            entry=usage_index.get((r['user_id'],r['node_id']))
+            if entry:entry['protocols'].append({'protocol':r['protocol'],'up':r['up'] or 0,'down':r['down'] or 0})
+        history={};hourly={}
+        cutoff=now()-180*86400
+        for r in d.execute('''SELECT user_id,(hour/86400)*86400 AS period,SUM(up) AS up,SUM(down) AS down
+                              FROM hourly_usage WHERE hour>=? GROUP BY user_id,period''',(cutoff,)):
+            history.setdefault(r['user_id'],[]).append({'time':r['period'],'up':r['up'],'down':r['down']})
+        for r in d.execute('''SELECT user_id,hour,up,down FROM hourly_usage WHERE hour>=? ORDER BY hour''',(now()-24*3600,)):
+            hourly.setdefault(r['user_id'],[]).append({'time':r['hour'],'up':r['up'],'down':r['down']})
         users = []
         for r in d.execute('SELECT * FROM users WHERE state!="deleted"'):
             u = {k:r[k] for k in r.keys() if k != 'token'}
             u['nodes'] = ctl.assigned_nodes(d,r)
             u['used_display'] = ctl.human_bytes(r['upload']+r['download'])
             u['quota_display'] = '不限流量' if r['is_admin'] else ctl.human_bytes(r['quota'])
+            u['traffic_by_node']=usage.get(r['id'],[])
+            u['traffic_all_time']=sum(x['up']+x['down'] for x in u['traffic_by_node'])
+            u['traffic_history']={'daily':history.get(r['id'],[]),'hourly':hourly.get(r['id'],[])}
             u['node_rules']={v['node_id']:v['rule'] for v in d.execute('SELECT * FROM user_node_rules WHERE user_id=?',(r['id'],))}
             eligible=r['state']=='active' and (r['is_admin'] or (r['expires']>now() and r['upload']+r['download']<r['quota']))
             u['entitled_node_ids']=[n['id'] for n in nodes if ctl.node_entitlement(d,r,n)]
@@ -89,7 +138,7 @@ def snapshot():
             n['desired_user_count']=len(ctl.effective(d,n))
             n['historical_used_user_count']=d.execute('SELECT COUNT(DISTINCT substr(principal,3,32)) FROM samples WHERE node_id=? AND up+down>0',(n['id'],)).fetchone()[0]
             n['recorded_traffic']=d.execute('SELECT COALESCE(SUM(up+down),0) FROM samples WHERE node_id=?',(n['id'],)).fetchone()[0]
-        return {'nodes':nodes,'plans':plans,'users':users,'server_time':now()}
+        return {'nodes':nodes,'plans':plans,'users':users,'pending_nodes':pending_nodes(),'server_time':now()}
     finally:d.close()
 
 def public_host(value):
@@ -99,7 +148,12 @@ def public_host(value):
 
 def connect_probe(p):
     import paramiko
-    host = public_host(p['host']); sp = port(p.get('ssh_port',22))
+    raw=str(p['host']).strip()
+    try: host=public_host(raw)
+    except Exception:
+        try: host=public_host(socket.gethostbyname(domain(raw)))
+        except Exception as e: raise Error('节点域名无法解析到公网 IPv4 地址。') from e
+    sp = port(p.get('ssh_port',22))
     # Read host key without authentication. No password goes to an unconfirmed host.
     sock = socket.create_connection((host,sp),timeout=10)
     t = paramiko.Transport(sock)
@@ -116,40 +170,95 @@ def connect_probe(p):
         return {'probe_id':token,'fingerprint':fp,'expires':now()+600}
     finally:t.close();sock.close()
 
+def primary_node_defaults(node_domain):
+    """Inherit public policy from the local controller, never its private keys."""
+    db=sqlite3.connect('file:'+str(ctl.DB)+'?mode=ro',uri=True,timeout=5)
+    db.row_factory=sqlite3.Row
+    try:
+        main=db.execute("SELECT sni,tags FROM nodes WHERE mode='local' AND state='active' LIMIT 1").fetchone()
+    finally:db.close()
+    if not main:raise Error('主服务器尚未登记为启用节点，无法自动继承配置。')
+    inherited=labels(','.join(json.loads(main['tags'])))
+    geography={'美国','香港','日本','韩国','新加坡','台湾','英国','德国','法国','加拿大','澳大利亚'}
+    region={'korea':'韩国','kr':'韩国','japan':'日本','jp':'日本','us':'美国','usa':'美国',
+            'hongkong':'香港','hk':'香港','singapore':'新加坡','sg':'新加坡'}
+    first=domain(node_domain).split('.')[0]
+    tags=labels([x for x in inherited if x not in geography]+[region.get(first,first)])
+    return domain(main['sni']),tags
+
+def reusable_management_key(host, ssh_port):
+    """Resume a failed console bootstrap using only keys made by this manager."""
+    keydir=ctl.HOME/'node-keys'
+    for private in sorted(keydir.glob('*')) if keydir.exists() else []:
+        if not re.fullmatch(r'[0-9a-f]{32}',private.name) or not private.is_file():continue
+        cmd=['ssh','-o','BatchMode=yes','-o','StrictHostKeyChecking=yes',
+             '-o','UserKnownHostsFile='+str(ctl.HOME/'known_hosts'),
+             '-o','IdentitiesOnly=yes','-o','ConnectTimeout=5',
+             '-p',str(ssh_port),'-i',str(private),'root@'+host,'true']
+        try:r=subprocess.run(cmd,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=8)
+        except (OSError,subprocess.TimeoutExpired):continue
+        if r.returncode==0:return private
+    raise Error('找不到可用的管理密钥；请提供 root 密码重新接入。')
+
+def remote_base_present(record):
+    for attempt in range(2):
+        try:r=subprocess.run(ctl.ssh_args(record)+['test -f /etc/sing-box-vps/config.json'],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=15)
+        except subprocess.TimeoutExpired as e:
+            if attempt:raise Error('检查已有部署阶段超时（已重试 1 次）。') from e
+            continue
+        except OSError as e:raise Error('检查已有部署阶段无法连接。') from e
+        if r.returncode not in (0,1):raise Error('节点 SSH 检查失败。')
+        return r.returncode==0
+    raise Error('检查已有部署阶段超时。')
+
 def initialise(p, task):
     import paramiko
+    if p.get('pending_id'):
+        f=pending_dir()/(str(p['pending_id'])+'.json')
+        if not f.is_file():raise Error('待重试记录不存在或已完成。')
+        saved=json.loads(f.read_text());p={**saved,**p}
+        probe_info=connect_probe({'host':p['domain'],'ssh_port':p.get('ssh_port',22)})
+        p.update(probe_id=probe_info['probe_id'],fingerprint=probe_info['fingerprint'],confirm_fingerprint=True)
     with PROBE_LOCK:probe = PROBES.pop(p.get('probe_id',''),None)
     if not probe or probe['expires']<now():raise Error('指纹检查已过期，请重新检查。')
     if p.get('fingerprint')!=probe['fingerprint']:raise Error('必须确认刚刚核对的指纹。')
     username = p.get('ssh_user','root')
     if username!='root':raise Error('首版网页初始化仅支持 root；非 root 节点请通过命令行接管。')
-    dom=domain(p['domain']);sni=domain(p.get('sni','www.microsoft.com'))
-    name=label(p['name']);tags=labels(p['tags']);email=p.get('email','')
-    if not tags:raise Error('至少需要一个节点标签。')
-    if not re.fullmatch(r'[^\s@]+@[^\s@]+\.[^\s@]+',email):raise Error('证书邮箱格式无效。')
-    client=paramiko.SSHClient()
-    key=paramiko.PKey.from_type_string(probe['key_type'],base64.b64decode(probe['key']))
-    hostkey_name=probe['host'] if probe['port']==22 else '['+probe['host']+']:'+str(probe['port'])
-    client.get_host_keys().add(hostkey_name,key.get_name(),key)
-    progress(task,'验证密码和主机指纹')
-    try:
-        client.connect(probe['host'],port=probe['port'],username=username,password=p.pop('password'),
-                       allow_agent=False,look_for_keys=False,timeout=15,auth_timeout=15,banner_timeout=15)
-        progress(task,'配置专属管理密钥')
-        nid=uid();keydir=ctl.HOME/'node-keys';keydir.mkdir(mode=0o700,exist_ok=True)
-        private=keydir/nid
-        subprocess.run(['ssh-keygen','-q','-t','ed25519','-N','','-f',str(private)],check=True,
-                       stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
-        pub=private.with_suffix('.pub').read_text().strip()
-        # Fixed remote program; stdin carries only a generated public key, never a password.
-        command="umask 077; mkdir -p /root/.ssh; chmod 700 /root/.ssh; cat >> /root/.ssh/authorized_keys; chmod 600 /root/.ssh/authorized_keys"
-        stdin,stdout,stderr=client.exec_command(command,timeout=15)
-        stdin.write(pub+'\n');stdin.channel.shutdown_write()
-        if stdout.channel.recv_exit_status()!=0:raise Error('管理密钥配置失败。')
-    finally:client.close()
-    with open(ctl.HOME/'known_hosts','a') as f:
-        f.write(hostkey_name+' '+probe['key_type']+' '+probe['key']+'\n')
-    os.chmod(ctl.HOME/'known_hosts',0o600)
+    dom=domain(p['domain']);sni,tags=primary_node_defaults(dom)
+    name=label(dom)
+    email='caizhengjun01@gmail.com'
+    password=p.pop('password',None)
+    if password:
+        client=paramiko.SSHClient()
+        key=paramiko.PKey.from_type_string(probe['key_type'],base64.b64decode(probe['key']))
+        hostkey_name=probe['host'] if probe['port']==22 else '['+probe['host']+']:'+str(probe['port'])
+        client.get_host_keys().add(hostkey_name,key.get_name(),key)
+        progress(task,'验证密码和主机指纹')
+        try:
+            try:
+                client.connect(probe['host'],port=probe['port'],username=username,password=password,
+                               allow_agent=False,look_for_keys=False,timeout=15,auth_timeout=15,banner_timeout=15)
+            except Exception as e:
+                raise Error('验证密码和主机指纹阶段失败：SSH 登录或认证超时。') from e
+            progress(task,'配置专属管理密钥')
+            nid=uid();keydir=ctl.HOME/'node-keys';keydir.mkdir(mode=0o700,exist_ok=True)
+            private=keydir/nid
+            subprocess.run(['ssh-keygen','-q','-t','ed25519','-N','','-f',str(private)],check=True,
+                           stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+            pub=private.with_suffix('.pub').read_text().strip()
+            # Fixed remote program; stdin carries only a generated public key, never a password.
+            command="umask 077; mkdir -p /root/.ssh; chmod 700 /root/.ssh; cat >> /root/.ssh/authorized_keys; chmod 600 /root/.ssh/authorized_keys"
+            stdin,stdout,stderr=client.exec_command(command,timeout=15)
+            stdin.write(pub+'\n');stdin.channel.shutdown_write()
+            if stdout.channel.recv_exit_status()!=0:raise Error('管理密钥配置失败。')
+        finally:client.close()
+        with open(ctl.HOME/'known_hosts','a') as f:
+            f.write(hostkey_name+' '+probe['key_type']+' '+probe['key']+'\n')
+        os.chmod(ctl.HOME/'known_hosts',0o600)
+    else:
+        progress(task,'验证已有管理密钥和主机指纹')
+        private=reusable_management_key(probe['host'],probe['port'])
+        nid=private.name
     record={'id':nid,'name':name,'host':probe['host'],'ssh_port':probe['port'],'ssh_user':username,
             'ssh_key':str(private),'mode':'ssh','domain':dom,'sni':sni,'email':email}
     with lock(ctl.HOME/'lock'):
@@ -157,8 +266,12 @@ def initialise(p, task):
         try:
             if d.execute('SELECT 1 FROM nodes WHERE host=? AND state!="deleted"',(record['host'],)).fetchone():
                 raise Error('该 IP 已登记，请勿重复初始化。')
-            if p.get('install',True):
+            progress(task,'清理上次初始化残留')
+            ctl.cleanup_remote_worker(record)
+            if p.get('install',True) and not remote_base_present(record):
                 progress(task,'安装依赖、代理程序与证书（可能需要数分钟）');ctl.install_new(record)
+            else:
+                progress(task,'检查并接管已有的兼容部署')
             progress(task,'上传节点管理程序');ctl.bootstrap(record)
             inspect=ctl.rpc(record,{'op':'inspect'})
             if inspect['domain']!=dom:raise Error('节点域名与现有部署不一致。')
@@ -170,6 +283,7 @@ def initialise(p, task):
                 (nid,name,dom,record['host'],record['ssh_port'],username,str(private),'ssh',sni,canonical(tags),
                  'active',None,'待同步',1,enrolled['version'],canonical(enrolled['ports']),now()))
             progress(task,'同步用户授权并发布订阅');ctl.sync_one(d,ctl.node(d,nid))
+            (pending_dir()/(hashlib.sha256(dom.encode()).hexdigest()+'.json')).unlink(missing_ok=True)
         finally:d.close()
 
 def operate(kind,p,task):
@@ -182,9 +296,11 @@ def operate(kind,p,task):
             if len(action)!=2:raise Error('无效操作。')
             entity,verb=action
             args=SimpleNamespace(action=verb,id=p.get('id'),sni=p.get('sni'))
-            if entity=='node' and verb in ('enable','disable','delete','sync','sni','edit'):
+            if entity=='node' and verb in ('enable','disable','delete','forget','sync','sni','edit'):
                 if verb=='edit':
                     n=ctl.node(d,args.id);name=label(p['name']);ts=labels(p['tags'])
+                    if n['state'] in ('deleting','deleted'):
+                        raise Error('节点正在删除或已删除，不能编辑。')
                     with d:d.execute('UPDATE nodes SET name=?,tags=?,revision=NULL WHERE id=?',(name,canonical(ts),n['id']))
                     ctl.reconcile(d)
                 else:ctl.node_cmd(d,args)
@@ -239,7 +355,7 @@ def validate_node_ids(d,values):
     if not set(values)<=valid:raise Error('选中的节点已删除或不存在，请刷新页面。')
     return sorted(set(values))
 
-KINDS={'reconcile','node.initialise','node.enable','node.disable','node.delete','node.sync','node.sni','node.edit',
+KINDS={'reconcile','node.initialise','node.enable','node.disable','node.delete','node.forget','node.sync','node.sni','node.edit',
        'plan.add','plan.edit','user.add','user.add-admin','user.edit','user.renew','user.disable','user.enable','user.delete','user.rotate-token'}
 
 def worker():
@@ -255,7 +371,11 @@ def worker():
             message=str(e) if isinstance(e,(Error,ValueError)) else '操作失败；请检查节点状态，必要时重新输入 SSH 密码。'
             for k in ('password','token'):
                 if p.get(k):message=message.replace(str(p[k]),'[已隐藏]')
-            progress(task,'失败','failed',message[:240])
+            with database() as d:
+                row=d.execute('SELECT stages,step FROM tasks WHERE id=?',(task,)).fetchone(); stages=json.loads(row[0] or '[]') if row else []
+                for x in stages:
+                    if x['state']=='running':x['state']='failed'
+                d.execute('UPDATE tasks SET state="failed",step="失败",updated=?,error=?,stages=? WHERE id=?',(now(),message[:240],json.dumps(stages,ensure_ascii=False),task))
         finally:p.clear();JOBS.task_done()
 
 def dispatch(req):
@@ -278,10 +398,15 @@ def dispatch(req):
     task=uid();kind=req['kind'];actor=safe_actor(req.get('actor','admin'))
     if kind=='node.initialise' and not p.get('confirm_fingerprint'):raise Error('请先核对 SSH 指纹。')
     if kind=='node.initialise':
+        if p.get('domain') and p.get('password'):
+            pending_dir().mkdir(mode=0o700,parents=True,exist_ok=True)
+            key=hashlib.sha256(domain(p['domain']).encode()).hexdigest()
+            saved={k:p.get(k) for k in ('domain','ssh_user','password','ssh_port')};saved.update(id=key,created=now())
+            (pending_dir()/(key+'.json')).write_text(canonical(saved));os.chmod(pending_dir()/(key+'.json'),0o600)
         # Reauthentication credentials belong only to the HTTP auth layer.
         p.pop('admin_password',None);p.pop('code',None)
     with database() as d:
-        d.execute('INSERT INTO tasks VALUES(?,?,?,?,?,?,?,?)',(task,kind,actor,now(),now(),'queued','等待执行',''))
+        d.execute('INSERT INTO tasks(id,kind,actor,created,updated,state,step,error,stages) VALUES(?,?,?,?,?,?,?,?,?)',(task,kind,actor,now(),now(),'queued','等待执行','','[]'))
         d.execute('INSERT INTO audit VALUES(?,?,?,?,?)',(uid(),actor,kind,str(p.get('id','new'))[:80],now()))
     JOBS.put_nowait((task,kind,p));return {'task_id':task}
 

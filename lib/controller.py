@@ -46,6 +46,13 @@ def database():
       PRIMARY KEY(node_id,principal));
     CREATE TABLE IF NOT EXISTS samples(node_id TEXT NOT NULL,principal TEXT NOT NULL,epoch TEXT NOT NULL,
       up INTEGER NOT NULL,down INTEGER NOT NULL,PRIMARY KEY(node_id,principal));
+    CREATE TABLE IF NOT EXISTS protocol_samples(node_id TEXT NOT NULL,principal TEXT NOT NULL,
+      protocol TEXT NOT NULL,epoch TEXT NOT NULL,up INTEGER NOT NULL,down INTEGER NOT NULL,
+      PRIMARY KEY(node_id,principal,protocol));
+    CREATE TABLE IF NOT EXISTS hourly_usage(user_id TEXT NOT NULL,hour INTEGER NOT NULL,
+      up INTEGER NOT NULL DEFAULT 0,down INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY(user_id,hour));
+    CREATE INDEX IF NOT EXISTS hourly_usage_hour ON hourly_usage(hour);
     CREATE TABLE IF NOT EXISTS plan_access(plan_id TEXT PRIMARY KEY,mode TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS plan_nodes(plan_id TEXT NOT NULL,node_id TEXT NOT NULL,PRIMARY KEY(plan_id,node_id));
     CREATE TABLE IF NOT EXISTS user_node_rules(user_id TEXT NOT NULL,node_id TEXT NOT NULL,rule TEXT NOT NULL,
@@ -150,10 +157,40 @@ def ssh_args(n):
             '-o','ConnectTimeout=10','-p',str(n['ssh_port']),'-i',str(key),
             '--',n['ssh_user']+'@'+n['host']]
 
+def ssh_run(n, extra, data=None, timeout=30, label='SSH 阶段', retries=1):
+    last=None
+    for attempt in range(retries+1):
+        try:
+            return run(ssh_args(n)+list(extra),data=data,timeout=timeout)
+        except Error as e:
+            last=e
+            if attempt<retries:time.sleep(1)
+    raise Error(label+'失败（已重试 '+str(retries)+' 次）：'+str(last)) from last
+
 def rpc(n,payload):
     if n['mode']=='local':cmd=['python3',str(BUNDLE/'lib/node.py')]
     else:cmd=ssh_args(n)+[('' if n['ssh_user']=='root' else 'sudo -n ')+'python3 /opt/sb-node/lib/node.py']
-    raw=run(cmd,canonical(payload).encode(),timeout=2400 if payload['op']=='enrol' else 90)
+    timeout=2400 if payload['op']=='enrol' else 90
+    process=None;last=None
+    for attempt in range(2 if payload['op'] in ('inspect','poll') else 1):
+        try:
+            process=subprocess.run(cmd,input=canonical(payload).encode(),stdout=subprocess.PIPE,
+                                   stderr=subprocess.PIPE,timeout=timeout);break
+        except subprocess.TimeoutExpired as e:
+            last=Error('节点 SSH 终端超时（操作：'+str(payload.get('op'))+'，第 '+str(attempt+1)+' 次）。')
+        except OSError as e:
+            last=Error('节点 SSH 无法连接（操作：'+str(payload.get('op'))+'）。')
+        if attempt==0:time.sleep(1)
+    if process is None:raise last
+    raw=process.stdout
+    if process.returncode:
+        # The fixed node worker prints a JSON error without secrets. Ignore SSH stderr.
+        try:
+            failure=json.loads(raw)
+            if failure.get('ok') is False and isinstance(failure.get('error'),str):
+                raise Error(failure['error'][:180])
+        except (ValueError,UnicodeDecodeError):pass
+        raise Error('节点 SSH 操作失败（退出码 '+str(process.returncode)+'）。')
     try:result=json.loads(raw)
     except ValueError as e:raise Error('节点响应无效。') from e
     if not result.get('ok'):raise Error(result.get('error','节点操作失败。'))
@@ -194,7 +231,7 @@ with tarfile.open(fileobj=b) as t:
     # Encoded fixed receiver avoids remote-shell quoting of user input.
     encoded=base64.b64encode(receiver.encode()).decode()
     command=("" if n['ssh_user']=='root' else "sudo -n ")+"python3 -c 'import base64;exec(base64.b64decode(\""+encoded+"\"))'"
-    run(ssh_args(n)+[command],buf.getvalue())
+    ssh_run(n,[command],buf.getvalue(),timeout=60,label='上传节点程序阶段')
 
 def install_new(n):
     if n['mode']=='local':raise Error('主服务器请先运行基础安装脚本，再选择接管。')
@@ -202,7 +239,12 @@ def install_new(n):
     source=BUNDLE/'install-sing-box-vps.sh'
     argv=['bash','-s','--','--domain',n['domain'],'--email',n['email'],'--sni',n['sni']]
     remote=('' if n['ssh_user']=='root' else 'sudo -n ')+' '.join(shlex.quote(x) for x in argv)
-    run(ssh_args(n)+[remote],source.read_bytes(),timeout=2400)
+    ssh_run(n,[remote],source.read_bytes(),timeout=2400,label='安装依赖与证书阶段')
+
+def cleanup_remote_worker(n):
+    if n['mode']=='local': return
+    command="systemctl stop sb-node-collect.service 2>/dev/null || true; for p in $(pgrep -f '^python3 /opt/sb-node/lib/node.py' || true); do [ \"$p\" = \"$$\" ] || kill -TERM $p; done; sleep 1; for p in $(pgrep -f '^python3 /opt/sb-node/lib/node.py' || true); do kill -KILL $p; done; rm -f /var/lib/sb-node/pending.json"
+    ssh_run(n,['sh -c '+shlex.quote(command)],timeout=30,label='清理初始化残留阶段')
 
 def sync_one(d,n):
     desired=effective(d,n)
@@ -233,14 +275,30 @@ def accept_stats(d,n,response):
             dd=v['down']-previous['down'] if previous else v['down']
             if du<0 or dd<0:raise Error('节点累计流量回退，停止自动结算。')
             userid,cycle=p.split('_')[1:]
+            if du or dd:
+                hour=now()//3600*3600
+                d.execute('''INSERT INTO hourly_usage(user_id,hour,up,down) VALUES(?,?,?,?)
+                  ON CONFLICT(user_id,hour) DO UPDATE SET up=up+excluded.up,down=down+excluded.down''',
+                  (userid,hour,du,dd))
             u=d.execute('SELECT * FROM users WHERE id=?',(userid,)).fetchone()
             if u and u['cycle']==cycle:
                 d.execute('UPDATE users SET upload=upload+?,download=download+? WHERE id=?',(du,dd,userid))
             else:
                 d.execute('UPDATE history SET up=up+?,down=down+? WHERE user_id=? AND cycle=?',(du,dd,userid,cycle))
             d.execute('INSERT OR REPLACE INTO samples VALUES(?,?,?,?,?)',(n['id'],p,epoch,v['up'],v['down']))
+        for key,v in response.get('protocol_totals',{}).items():
+            if '|' not in key:continue
+            p,protocol=key.split('|',1)
+            if not re.fullmatch(r'm_[0-9a-f]{32}_[0-9a-f]{32}',p) or not re.fullmatch(r'[a-z0-9-]{1,48}',protocol):continue
+            old=d.execute('SELECT up,down FROM protocol_samples WHERE node_id=? AND principal=? AND protocol=?',
+                          (n['id'],p,protocol)).fetchone()
+            if old and (v['up']<old['up'] or v['down']<old['down']):
+                raise Error('协议累计流量回退，停止自动展示。')
+            d.execute('INSERT OR REPLACE INTO protocol_samples VALUES(?,?,?,?,?,?)',
+                      (n['id'],p,protocol,epoch,v['up'],v['down']))
         d.execute('UPDATE nodes SET epoch=?,last_sample=?,last_online=?,status=? WHERE id=?',
                   (epoch,response['sample_at'],now(),'在线',n['id']))
+        d.execute('DELETE FROM hourly_usage WHERE hour<?',(now()-181*86400,))
 
 def poll_one(d,n):
     response=rpc(n,{'op':'poll'})
@@ -362,10 +420,23 @@ def node_cmd(d,args):
         elif args.action=='edit':edit_node(d,n)
         elif args.action=='sync':sync_one(d,n)
         elif args.action=='sni':change_sni(d,n,args.sni)
+        elif args.action=='forget':
+            forget_unreachable_node(d,n)
         elif args.action in ('disable','enable','delete'):
             state={'disable':'disabled','enable':'active','delete':'deleting'}[args.action]
             with d:d.execute('UPDATE nodes SET state=?,status=? WHERE id=?',(state,'待同步',n['id']))
             reconcile(d)
+
+def forget_unreachable_node(d,n):
+    """Complete local deletion after an operator confirms the VM is gone."""
+    if n['mode']=='local' or n['state']!='deleting':
+        raise Error('仅允许对待清理的远端节点完成本地删除。')
+    with d:
+        d.execute('DELETE FROM grants WHERE node_id=?',(n['id'],))
+        d.execute('DELETE FROM plan_nodes WHERE node_id=?',(n['id'],))
+        d.execute('DELETE FROM user_node_rules WHERE node_id=?',(n['id'],))
+        d.execute("UPDATE nodes SET state='deleted',status='已从管理器移除；远端凭据撤销未验证' WHERE id=?",(n['id'],))
+    publish(d)
 
 def plan_cmd(d,args):
     if args.action=='list':
@@ -476,13 +547,13 @@ def main():
     os.umask(0o077)
     parser=argparse.ArgumentParser()
     sub=parser.add_subparsers(dest='kind')
-    for name,actions in [('node',['list','show','add','edit','sync','disable','enable','delete','sni']),
+    for name,actions in [('node',['list','show','add','edit','sync','disable','enable','delete','forget','sni']),
                          ('plan',['list','add','edit']),
                          ('user',['list','show','add','add-admin','renew','disable','enable','delete','rotate-token','qr'])]:
         p=sub.add_parser(name);a=p.add_subparsers(dest='action',required=True)
         for act in actions:
             q=a.add_parser(act)
-            if act in ('show','edit','sync','disable','enable','delete','renew','rotate-token','qr','sni'):q.add_argument('id')
+            if act in ('show','edit','sync','disable','enable','delete','forget','renew','rotate-token','qr','sni'):q.add_argument('id')
             if act=='sni':q.add_argument('sni')
             if act=='qr':q.add_argument('--format',choices=['singbox','karing','mihomo','base64','links'],default='singbox');q.add_argument('--output')
     sub.add_parser('reconcile');setup=sub.add_parser('setup');setup.add_argument('--domain',required=True)

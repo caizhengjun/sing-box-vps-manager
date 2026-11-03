@@ -13,6 +13,14 @@ sys.path.insert(0,str(CONSOLE))
 import broker
 
 class BrokerTests(unittest.TestCase):
+ def test_new_node_inherits_public_settings_from_local_node(self):
+  with tempfile.TemporaryDirectory() as tmp:
+   db=Path(tmp)/'manager.sqlite'
+   with sqlite3.connect(db) as d:
+    d.execute('CREATE TABLE nodes(mode TEXT,state TEXT,sni TEXT,tags TEXT)')
+    d.execute('INSERT INTO nodes VALUES(?,?,?,?)',('local','active','addons.mozilla.org','["美国","测试"]'))
+   with mock.patch.object(broker.ctl,'DB',db):
+    self.assertEqual(broker.primary_node_defaults('korea.tongnan.shop'),('addons.mozilla.org',['测试','韩国']))
  def test_private_and_loopback_ips_rejected(self):
   for ip in ('127.0.0.1','10.1.2.3','169.254.169.254','::1'):
    with self.assertRaises(broker.Error):broker.public_host(ip)

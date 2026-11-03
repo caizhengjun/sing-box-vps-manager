@@ -189,8 +189,6 @@ def probe(request:Request,body:dict):session(request,True);return broker('probe'
 @app.post('/api/tasks')
 def submit(request:Request,body:dict):
     session(request,True)
-    if body.get('kind') in ('node.delete','node.initialise','user.delete','user.rotate-token'):
-        credentials(body.get('reauth',{}),request.state.identity)
     return broker('submit',body.get('params',{}),kind=body.get('kind'),actor=request.state.identity)
 
 @app.get('/api/users/{user_id}/subscription')

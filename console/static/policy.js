@@ -39,15 +39,20 @@ function nodeDetails(id){
  const n=data.nodes.find(x=>x.id===id),h=n.health;
  const protocols=h?.ports||JSON.parse(n.ports||'[]');
  const fresh=!!n.health_checked&&Date.now()/1000-n.health_checked<120;
- const rows=protocols.map(p=>{const listeners=p.listeners?Object.entries(p.listeners).map(([t,on])=>`${t.toUpperCase()}: ${on?'监听':'未监听'}`).join(' / '):'尚未采集';return `<article class="protocol-row"><div><strong>${esc(p.protocol)}</strong><span>${esc(p.type)} · ${p.port}</span></div><div><span class="badge ${p.listeners&&Object.values(p.listeners).every(Boolean)?'good':'bad'}">${esc(listeners)}</span><small>外网连接：未验证</small></div></article>`;}).join('');
- showModal(`<h2>${esc(n.name)} · 节点详情</h2><div class="notice">${fresh?'以下为最近采样结果。':'采样尚无或已过期，请同步节点刷新。'}“监听”只表示本机端口存在，不代表云安全组、TLS、认证及外网连接均正常。健康检查不使用用户私密凭据。</div>`+
+ const rows=protocols.map(p=>{const known=fresh&&h&&p.listeners;const ok=known&&h.active&&Object.values(p.listeners).every(Boolean);const stateText=!known?'待采样':ok?'本机监听':'未监听';const transport=p.listeners?Object.keys(p.listeners).join('/').toUpperCase():'';return `<article class="protocol-tile"><div class="protocol-tile-head"><strong>${esc(p.protocol)}</strong><span class="status-dot ${!known?'unknown':ok?'good':'bad'}" aria-hidden="true"></span></div><small>${esc(transport)} ${esc(p.port)}</small><span class="protocol-state">${esc(stateText)}</span></article>`;}).join('');
+ showModal(`<h2>${esc(n.name)} · 节点详情</h2>${n.state==='deleting'?'':`<div class="detail-toolbar">${btn('编辑名称与标签','node-edit',id)}</div>`}<div class="notice">${fresh?'以下为最近采样结果。':'采样尚无或已过期，请同步节点刷新。'}“监听”只表示本机端口存在，不代表云安全组、TLS、认证及外网连接均正常。健康检查不使用用户私密凭据。</div>`+
   meta('节点 IP / SSH 端口',(n.host==='local'?(h?.addresses?.join(', ')||'本机'):n.host)+' : '+n.ssh_port)+meta('连接域名',n.domain)+meta('核心版本',h?.version||n.version||'尚未采集')+meta('服务进程',h?(h.active?'运行中':'未运行'):'尚未采集')+
   meta('采样时间',n.health_checked?date(n.health_checked):'尚未采集')+meta('用户计量',n.stats_ready?'已通过接管验证':'未就绪')+meta('同步状态',n.status||'未知')+
   meta('已下发授权 / 应授权用户',n.assigned_user_count+' / '+n.desired_user_count)+meta('有历史流量的用户',n.historical_used_user_count)+meta('已记录累计流量',gb(n.recorded_traffic))+
-  '<h3 class="section-title">部署协议与端口</h3>'+ (rows||'<p>暂无协议记录，请同步节点。</p>')+
+  '<h3 class="section-title">部署协议与端口</h3><p>圆点表示最近采样的本机监听状态；不代表外网连接已验证。</p><div class="protocol-grid">'+ (rows||'<p>暂无协议记录，请同步节点。</p>')+'</div>'+
   '<h3 class="section-title">当前已下发授权的用户</h3>'+ (n.applied_users.map(u=>`<div class="meta"><span>${esc(u.name)}</span><strong>${esc(state(u.state))}</strong></div>`).join('')||'<p>暂无已下发用户。</p>')+
-  '<p>已下发人数不是当前在线连接数；待撤销授权在节点同步成功前仍可能出现在这里。</p><div class="actions"><button id="refresh-health">同步并刷新采样</button><button data-close>关闭</button></div>');
+  '<p>已下发人数不是当前在线连接数；待撤销授权在节点同步成功前仍可能出现在这里。</p><div class="actions">'+
+  `<button id="refresh-health">${n.state==='deleting'?'重试清理':'同步并刷新'}</button>`+
+  (n.state==='deleting'?btn('服务器已释放 · 完成本地删除','node.forget',id,true):btn('更新 SNI','node-sni',id)+
+    btn(n.state==='active'?'停用节点':'启用节点',n.state==='active'?'node.disable':'node.enable',id)+btn('删除节点','node.delete',id,true))+
+  '<button data-close>关闭</button></div>');
  modal.querySelector('#refresh-health').onclick=()=>submit('node.sync',{id}).catch(e=>toast(e.message));
+ modal.querySelectorAll('[data-action]').forEach(b=>b.onclick=()=>{closeModal();action(b.dataset.action,b.dataset.id);});
 }
 
 const previousAction=action;

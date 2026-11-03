@@ -39,8 +39,10 @@ def run(args, data=None, timeout=120, env=None):
     try:
         p = subprocess.run([str(x) for x in args], input=data, stdout=subprocess.PIPE,
                            stderr=subprocess.PIPE, timeout=timeout, env=env)
-    except (OSError, subprocess.TimeoutExpired) as e:
-        raise Error('命令无法完成：' + str(args[0])) from e
+    except subprocess.TimeoutExpired as e:
+        raise Error('命令执行超时：' + str(args[0])) from e
+    except OSError as e:
+        raise Error('命令无法启动：' + str(args[0])) from e
     if p.returncode:
         # Do not echo raw subprocess stderr: it may contain a URL or candidate secrets.
         raise Error('命令执行失败：' + str(args[0]) + '（退出码 ' + str(p.returncode) + '）')
@@ -161,21 +163,24 @@ def fields(data):
         else: raise Error('不支持的统计响应字段。')
         yield key >> 3, value
 
-def query_stats(address='127.0.0.1:10085'):
+def query_stats_detailed(address='127.0.0.1:10085'):
     import grpc
     with grpc.insecure_channel(address) as channel:
         method = channel.unary_unary('/v2ray.core.app.stats.command.StatsService/QueryStats',
                                      request_serializer=lambda x: x, response_deserializer=lambda x: x)
         response = method(b'', timeout=5)  # Never reset live counters.
-    result = {}
+    result = {'users': {}, 'outbounds': {}}
     for number, raw in fields(response):
         if number != 1: continue
         item = dict(fields(raw))
         name = item.get(1, b'').decode()
         val = item.get(2, 0)
         if val >= (1 << 63): raise Error('统计计数器溢出。')
-        if name.startswith('user>>>'):
-            parts = name.split('>>>')
-            if len(parts) == 4 and parts[2] == 'traffic' and parts[3] in ('uplink', 'downlink'):
-                result.setdefault(parts[1], {'up': 0, 'down': 0})['up' if parts[3] == 'uplink' else 'down'] = val
+        parts = name.split('>>>')
+        if len(parts) == 4 and parts[0] in ('user','outbound') and parts[2] == 'traffic' and parts[3] in ('uplink', 'downlink'):
+            target=result['users' if parts[0]=='user' else 'outbounds']
+            target.setdefault(parts[1], {'up': 0, 'down': 0})['up' if parts[3] == 'uplink' else 'down'] = val
     return result
+
+def query_stats(address='127.0.0.1:10085'):
+    return query_stats_detailed(address)['users']

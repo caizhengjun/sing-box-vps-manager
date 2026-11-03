@@ -38,11 +38,10 @@ async def handle(request):
     headers={'X-Subscription-Start':str(row['started']),
              'Profile-Title':base64.b64encode(row['name'].encode('utf-8')).decode(),
              'Cache-Control':'no-store','X-Content-Type-Options':'nosniff'}
-    # Absence of quota metadata is the most interoperable representation of an
-    # unlimited, non-expiring subscription. total=0/expire=0 is often rendered
-    # as "0 B" and "1970-01-01" by mobile clients.
-    if not row.get('is_admin'):
-        headers['Subscription-Userinfo']=f"upload={row['upload']}; download={row['download']}; total={row['quota']}; expire={row['expires']}"
+    # Keep usage visible for administrators too. total=0/expire=0 means unlimited
+    # and non-expiring; clients that support Subscription-Userinfo can still show
+    # the accumulated upload/download counters.
+    headers['Subscription-Userinfo']=f"upload={row['upload']}; download={row['download']}; total={row['quota']}; expire={row['expires']}"
     return web.Response(status=200 if outs else 403,text=body,content_type=media.split(';')[0],headers=headers)
 
 async def main():

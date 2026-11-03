@@ -25,3 +25,7 @@ node --check console/static/app.js
 ```
 
 No end-to-end claim should be made before testing the actual Cloudflare route, enrollment, desktop/mobile layout and disposable remote-node initialization. Root broker necessarily manages privileged software; keep its socket inaccessible to other users, keep the code root-owned and do not offer a generic command-execution endpoint.
+
+最新网页流程：手机窄屏使用 Material 3 风格导航和精简列表，详情按需打开；列表每页 10 项。新增全新节点只填写公网 IP、节点域名、root 账号和密码，再核对服务商显示的 SSH 主机指纹。主节点的 REALITY SNI 与通用标签由管理端读取，地区标签由节点域名前缀生成，证书邮箱使用既定联系人地址；新节点独立签发证书并生成密钥。管理员密码和 TOTP 仅在登录时输入，已登录操作通过确认弹框和 CSRF 会话校验。
+
+节点编辑：列表行和详情页顶部均有“编辑”入口，可修改显示名称与多个标签。编辑窗口在提交前显示标签自动匹配可能影响的套餐及用户数；保存后由管理器重新计算授权并同步订阅。处于待清理或已删除状态的节点不可编辑。

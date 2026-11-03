@@ -55,6 +55,21 @@ class ControlTests(unittest.TestCase):
    ctl.reconcile(self.db)
   self.assertEqual(ctl.node(self.db,self.nid)['state'],'deleting')
   self.assertIn('待处理',ctl.node(self.db,self.nid)['status'])
+ def test_unreachable_node_local_delete_keeps_history(self):
+  principal='m_'+self.uid+'_'+self.cid
+  with self.db:
+   self.db.execute("UPDATE nodes SET mode='ssh',state='deleting',host='203.0.113.10' WHERE id=?",(self.nid,))
+   self.db.execute('INSERT INTO grants VALUES(?,?,?)',(self.nid,principal,'[]'))
+   self.db.execute('INSERT INTO samples VALUES(?,?,?,?,?)',(self.nid,principal,'epoch',12,34))
+   self.db.execute('INSERT INTO plan_nodes VALUES(?,?)',(self.pid,self.nid))
+   self.db.execute('INSERT INTO user_node_rules VALUES(?,?,?)',(self.uid,self.nid,'allow'))
+  ctl.forget_unreachable_node(self.db,ctl.node(self.db,self.nid))
+  self.assertEqual(ctl.node(self.db,self.nid)['state'],'deleted')
+  self.assertIn('未验证',ctl.node(self.db,self.nid)['status'])
+  for table in ('grants','plan_nodes','user_node_rules'):
+   self.assertEqual(self.db.execute('SELECT COUNT(*) FROM '+table+' WHERE node_id=?',(self.nid,)).fetchone()[0],0)
+  self.assertEqual(self.db.execute('SELECT SUM(up+down) FROM samples WHERE node_id=?',(self.nid,)).fetchone()[0],46)
+  with self.assertRaises(common.Error):ctl.forget_unreachable_node(self.db,ctl.node(self.db,self.nid))
  def test_subscription_userinfo_without_exposing_token(self):
   ctl.publish(self.db)
   raw=(ctl.PUBLIC_DIR/'published.json').read_text()
@@ -199,10 +214,10 @@ class LocalControllerTest(unittest.TestCase):
   record={'mode':'local','host':'local','name':'本机','domain':'node.example.com',
           'ssh_port':22,'ssh_user':'root','ssh_key':''}
   calls=[]
-  def fake_run(argv,data=None,timeout=0):
-   calls.append((argv,json.loads(data)))
-   return json.dumps({'ok':True,'result':{'active':True}}).encode()
-  with mock.patch.object(ctl,'run',side_effect=fake_run),mock.patch.object(ctl,'ssh_args',side_effect=AssertionError('unexpected SSH')):
+  def fake_run(argv,input=None,**kwargs):
+   calls.append((argv,json.loads(input)))
+   return mock.Mock(returncode=0,stdout=json.dumps({'ok':True,'result':{'active':True}}).encode())
+  with mock.patch.object(ctl.subprocess,'run',side_effect=fake_run),mock.patch.object(ctl,'ssh_args',side_effect=AssertionError('unexpected SSH')):
    result=ctl.rpc(record,{'op':'inspect'})
   self.assertEqual(result,{'active':True})
   self.assertEqual(calls[0][0][:2],['python3',str(ctl.BUNDLE/'lib/node.py')])
@@ -213,7 +228,7 @@ class NodeAccountingTest(unittest.TestCase):
   old=node_worker.HOME;node_worker.HOME=Path(tmp.name)
   self.addCleanup(setattr,node_worker,'HOME',old)
   db=node_worker.database();self.addCleanup(db.close)
-  with mock.patch.object(node_worker,'generation',return_value='boot:1:1'),mock.patch.object(node_worker,'query_stats',return_value={'m_'+('a'*32)+'_'+('b'*32):{'up':12,'down':34}}):
+  with mock.patch.object(node_worker,'generation',return_value='boot:1:1'),mock.patch.object(node_worker,'query_stats_detailed',return_value={'users':{'m_'+('a'*32)+'_'+('b'*32):{'up':12,'down':34}},'outbounds':{}}):
    node_worker.collect(db)
   row=db.execute('SELECT * FROM counters').fetchone()
   self.assertEqual((row['raw_up'],row['raw_down'],row['total_up'],row['total_down']),(12,34,12,34))

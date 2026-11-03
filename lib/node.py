@@ -3,6 +3,7 @@
 import argparse
 import copy
 import functools
+import hashlib
 import http.server
 import ipaddress
 import json
@@ -20,7 +21,7 @@ import time
 
 from common import (BASE, BIN, UNIT, VERSION, PRINCIPAL, Error, atomic, canonical,
                     credentials, db_open, digest, domain, load_json, lock, now,
-                    query_stats, run, uid, write_json)
+                    query_stats, query_stats_detailed, run, uid, write_json)
 from formats import outbounds
 
 HOME = Path('/var/lib/sb-node')
@@ -36,6 +37,9 @@ def database():
     CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS counters(principal TEXT PRIMARY KEY, generation TEXT NOT NULL,
       raw_up INTEGER NOT NULL,raw_down INTEGER NOT NULL,total_up INTEGER NOT NULL,total_down INTEGER NOT NULL);
+    CREATE TABLE IF NOT EXISTS protocol_counters(principal TEXT NOT NULL,protocol TEXT NOT NULL,
+      generation TEXT NOT NULL,raw_up INTEGER NOT NULL,raw_down INTEGER NOT NULL,
+      total_up INTEGER NOT NULL,total_down INTEGER NOT NULL,PRIMARY KEY(principal,protocol));
     ''')
     with db:
         db.execute("INSERT OR IGNORE INTO meta VALUES('epoch',?)",(uid(),))
@@ -50,10 +54,10 @@ def generation():
 
 def collect(db):
     g=generation()
-    values=query_stats(API)
+    values=query_stats_detailed(API)
     if generation()!=g: raise Error('采样期间进程已更换，稍后重试。')
     with db:
-        for name,v in values.items():
+        for name,v in values['users'].items():
             if not PRINCIPAL.fullmatch(name): continue
             old=db.execute('SELECT * FROM counters WHERE principal=?',(name,)).fetchone()
             if old:
@@ -64,12 +68,31 @@ def collect(db):
             else:up,down=v['up'],v['down']
             db.execute('INSERT OR REPLACE INTO counters VALUES(?,?,?,?,?,?)',
                        (name,g,v['up'],v['down'],up,down))
+        state=load_json(HOME/'state.json',{})
+        for principal in state.get('grants',{}):
+            for i in state.get('baseline',{}).get('inbounds',[]):
+                protocol=i['tag']
+                if protocol=='ss-legacy':continue
+                value=values['outbounds'].get(meter_tag(principal,protocol))
+                if value is None:continue
+                old=db.execute('SELECT * FROM protocol_counters WHERE principal=? AND protocol=?',
+                               (principal,protocol)).fetchone()
+                if old:
+                    same=old['generation']==g
+                    du=value['up']-old['raw_up'] if same and value['up']>=old['raw_up'] else value['up']
+                    dd=value['down']-old['raw_down'] if same and value['down']>=old['raw_down'] else value['down']
+                    up,down=old['total_up']+du,old['total_down']+dd
+                else:up,down=value['up'],value['down']
+                db.execute('INSERT OR REPLACE INTO protocol_counters VALUES(?,?,?,?,?,?,?)',
+                           (principal,protocol,g,value['up'],value['down'],up,down))
         db.execute("INSERT OR REPLACE INTO meta VALUES('sample_at',?)",(str(now()),))
 
 def totals(db):
     return {'epoch':db.execute("SELECT value FROM meta WHERE key='epoch'").fetchone()[0],
             'sample_at':int((db.execute("SELECT value FROM meta WHERE key='sample_at'").fetchone() or [0])[0]),
-            'totals':{r['principal']:{'up':r['total_up'],'down':r['total_down']} for r in db.execute('SELECT * FROM counters')}}
+            'totals':{r['principal']:{'up':r['total_up'],'down':r['total_down']} for r in db.execute('SELECT * FROM counters')},
+            'protocol_totals':{r['principal']+'|'+r['protocol']:{'up':r['total_up'],'down':r['total_down']}
+                               for r in db.execute('SELECT * FROM protocol_counters')}}
 
 def read_config():
     cfg=load_json(BASE/'config.json')
@@ -132,12 +155,13 @@ def install_client():
     import urllib.request,hashlib,tarfile,platform
     # A custom server build with the Naive outbound is also a complete client.
     current=run([BIN,'version']).decode()
-    if current.splitlines()[0]=='sing-box version '+VERSION and 'with_naive_outbound' in current:
+    if (current.splitlines()[0]=='sing-box version '+VERSION and 'with_naive_outbound' in current
+            and (BIN.parent/'libcronet.so').is_file()):
         return BIN
     arch={'x86_64':'amd64','aarch64':'arm64'}.get(platform.machine())
     if not arch:raise Error('不支持的架构。')
     target=Path('/usr/local/lib/sing-box-vps/client-runtime')
-    if (target/'sing-box').exists():
+    if (target/'sing-box').exists() and (target/'libcronet.so').is_file():
         v=run([target/'sing-box','version']).decode()
         if v.splitlines()[0]=='sing-box version '+VERSION:return target/'sing-box'
     meta=json.load(urllib.request.urlopen('https://api.github.com/repos/SagerNet/sing-box/releases/tags/v'+VERSION,timeout=30))
@@ -182,8 +206,22 @@ def metered_config(baseline, grants):
             else:users.append({'name':p,'password':c['ss'] if kind=='shadowsocks' else c['password']})
         if users:kept.append(i) # Never leave an auth-less listener behind.
     cfg['inbounds']=kept
-    cfg.setdefault('experimental',{})['v2ray_api']={'listen':API,'stats':{'enabled':True,'users':[g['principal'] for g in grants]}}
+    rules=[];outbound_tags=[]
+    for i in kept:
+        if i['tag']=='ss-legacy':continue
+        for g in grants:
+            tag=meter_tag(g['principal'],i['tag'])
+            rules.append({'inbound':[i['tag']],'auth_user':[g['principal']],
+                          'action':'route','outbound':tag})
+            cfg.setdefault('outbounds',[]).append({'type':'direct','tag':tag})
+            outbound_tags.append(tag)
+    cfg.setdefault('route',{}).setdefault('rules',[])[:0]=rules
+    cfg.setdefault('experimental',{})['v2ray_api']={'listen':API,'stats':{'enabled':True,
+        'users':[g['principal'] for g in grants],'outbounds':outbound_tags}}
     return cfg
+
+def meter_tag(principal, protocol):
+    return 'meter_'+hashlib.sha256((principal+'|'+protocol).encode()).hexdigest()[:32]
 
 def selftest(baseline, client=None, binary=BIN):
     """Every managed protocol must transfer traffic AND increment its named user counter."""
@@ -202,8 +240,6 @@ def selftest(baseline, client=None, binary=BIN):
         i['users']=[];i['listen']='127.0.0.1';i['listen_port']=choose()
     cfg=metered_config(fixture,[g]);api='127.0.0.1:'+str(choose())
     cfg['experimental']['v2ray_api']['listen']=api
-    cfg['route']={'rules':[],'final':'direct'}
-    cfg['outbounds']=[{'type':'direct','tag':'direct'}]
     class Handler(http.server.BaseHTTPRequestHandler):
         def do_GET(self):
             body=b'sb-meter-proof-'*4096
@@ -220,7 +256,7 @@ def selftest(baseline, client=None, binary=BIN):
             time.sleep(2)
             if server.poll() is not None:raise Error('计量自测服务无法启动。')
             outs=outbounds(cfg,(BASE/'domain').read_text().strip(),'proof','proof',g['principal'],g['credentials'])
-            previous={'up':0,'down':0}
+            previous={'up':0,'down':0};previous_outbound={}
             for o in outs:
                 o['server']='127.0.0.1'
                 local=choose()
@@ -234,9 +270,17 @@ def selftest(baseline, client=None, binary=BIN):
                               f'http://127.0.0.1:{origin.server_port}/'],timeout=25)
                     if body!=b'sb-meter-proof-'*4096:raise Error('计量自测内容不匹配。')
                     time.sleep(.15)
-                    current=query_stats(api).get(g['principal'],{})
+                    all_stats=query_stats_detailed(api)
+                    current=all_stats['users'].get(g['principal'],{})
                     if current.get('up',0)<=previous['up'] or current.get('down',0)<=previous['down']:
                         raise Error('逐用户流量计数未增加：'+o['type'])
+                    inbound=next(i['tag'] for i in fixture['inbounds'] if i['listen_port']==o['server_port'])
+                    stat_tag=meter_tag(g['principal'],inbound)
+                    counted=all_stats['outbounds'].get(stat_tag,{})
+                    before=previous_outbound.get(stat_tag,{'up':0,'down':0})
+                    if counted.get('up',0)<=before['up'] or counted.get('down',0)<=before['down']:
+                        raise Error('逐用户协议计数未增加：'+inbound)
+                    previous_outbound[stat_tag]=counted
                     result.append(o['type']+('-h3' if o.get('quic') else '-h2') if o['type']=='naive' else o['type'])
                     previous=current
                 finally:
