@@ -4,6 +4,7 @@ import argparse
 import copy
 import functools
 import http.server
+import ipaddress
 import json
 import os
 from pathlib import Path
@@ -88,9 +89,24 @@ def status():
     active=subprocess.run(['systemctl','is-active','--quiet',UNIT]).returncode==0
     available=state.get('baseline',cfg)
     reality=next((i for i in available['inbounds'] if i.get('tag')=='vless-reality'),None)
+    listeners={}
+    for transport,flag in (('tcp','-ltnH'),('udp','-lunH')):
+        listeners[transport]={int(row.split()[3].rsplit(':',1)[1]) for row in run(['ss',flag]).decode().splitlines()
+                              if len(row.split())>3 and row.split()[3].rsplit(':',1)[-1].isdigit()}
+    ports=[]
+    addresses=[]
+    try:
+        for interface in json.loads(run(['ip','-j','-4','address','show','scope','global'])):
+            addresses.extend(a['local'] for a in interface.get('addr_info',[]) if a.get('family')=='inet' and ipaddress.ip_address(a['local']).is_global)
+    except (Error,ValueError,KeyError):pass
+    for i in cfg['inbounds']:
+        transports=['udp'] if i['type'] in ('hysteria2','tuic') else ['tcp','udp'] if i['type'] in ('naive','shadowsocks') else ['tcp']
+        ports.append({'protocol':i['tag'],'type':i['type'],'port':i['listen_port'],
+                      'listeners':{t:i['listen_port'] in listeners[t] for t in transports},
+                      'configured_users':len(i.get('users',[])), 'wan_verified':False})
     return {'sni':reality.get('tls',{}).get('server_name') if reality else None,'version':ver.splitlines()[0], 'active':active,
             'domain':(BASE/'domain').read_text().strip(),
-            'ports':[{'protocol':i['tag'],'type':i['type'],'port':i['listen_port']} for i in available['inbounds']],
+            'ports':ports,'addresses':sorted(set(addresses)),
             'stats_ready':bool(state.get('stats_ready')), 'revision':state.get('revision'),
             'unmanaged_accounts':state.get('unmanaged_accounts',0)}
 

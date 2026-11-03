@@ -46,6 +46,11 @@ def database():
       PRIMARY KEY(node_id,principal));
     CREATE TABLE IF NOT EXISTS samples(node_id TEXT NOT NULL,principal TEXT NOT NULL,epoch TEXT NOT NULL,
       up INTEGER NOT NULL,down INTEGER NOT NULL,PRIMARY KEY(node_id,principal));
+    CREATE TABLE IF NOT EXISTS plan_access(plan_id TEXT PRIMARY KEY,mode TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS plan_nodes(plan_id TEXT NOT NULL,node_id TEXT NOT NULL,PRIMARY KEY(plan_id,node_id));
+    CREATE TABLE IF NOT EXISTS user_node_rules(user_id TEXT NOT NULL,node_id TEXT NOT NULL,rule TEXT NOT NULL,
+      PRIMARY KEY(user_id,node_id));
+    CREATE TABLE IF NOT EXISTS node_health(node_id TEXT PRIMARY KEY,checked INTEGER NOT NULL,payload TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS history(user_id TEXT NOT NULL,cycle TEXT NOT NULL,up INTEGER NOT NULL,
       down INTEGER NOT NULL,started INTEGER NOT NULL,ended INTEGER NOT NULL);
     ''')
@@ -112,14 +117,23 @@ def print_user(d,u,include_id=True):
         suffix='' if n['state']=='active' else ' ['+n['state']+'，'+str(n['status'])+']'
         print('节点：'+n['name']+' ('+n['domain']+')　协议：'+(', '.join(n['protocols']) or '无')+suffix)
 
+def node_entitlement(d,u,n):
+    """Explicit deny > explicit allow > plan's selected nodes or tag rules."""
+    override=d.execute('SELECT rule FROM user_node_rules WHERE user_id=? AND node_id=?',(u['id'],n['id'])).fetchone()
+    if override:return override['rule']=='allow'
+    policy=d.execute('SELECT mode FROM plan_access WHERE plan_id=?',(u['plan_id'],)).fetchone()
+    if policy and policy['mode']=='selected':
+        return bool(d.execute('SELECT 1 FROM plan_nodes WHERE plan_id=? AND node_id=?',(u['plan_id'],n['id'])).fetchone())
+    tags=d.execute('SELECT tags FROM plans WHERE id=?',(u['plan_id'],)).fetchone()
+    return bool(tags and set(json.loads(n['tags'])).intersection(json.loads(tags['tags'])))
+
 def effective(d,n):
-    tags=set(json.loads(n['tags']))
-    if n['state']!='active' or not tags or not n['stats_ready']:return []
+    if n['state']!='active' or not n['stats_ready']:return []
     result=[]
     for u in d.execute('SELECT users.*,plans.tags AS plan_tags FROM users JOIN plans ON users.plan_id=plans.id'):
         if u['state']!='active':continue
         if not u['is_admin'] and (u['expires']<=now() or u['upload']+u['download']>=u['quota']):continue
-        if tags.intersection(json.loads(u['plan_tags'])):
+        if node_entitlement(d,u,n):
             result.append({'principal':'m_'+u['id']+'_'+u['cycle'],'name':u['name']})
     return result
 
@@ -231,6 +245,9 @@ def accept_stats(d,n,response):
 def poll_one(d,n):
     response=rpc(n,{'op':'poll'})
     accept_stats(d,n,response)
+    health=response.get('status',{})
+    # Status contains no credentials; retain explicit check time, never infer WAN reachability.
+    with d:d.execute('INSERT OR REPLACE INTO node_health VALUES(?,?,?)',(n['id'],now(),canonical(health)))
     reported=response.get('status',{}).get('sni')
     if reported and reported!=n['sni']:
         with d:d.execute('UPDATE nodes SET sni=?,revision=NULL,status=? WHERE id=?',(reported,'SNI 已变化，待刷新订阅',n['id']))

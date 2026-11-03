@@ -9,10 +9,12 @@ from unittest import mock
 
 LIB=Path(__file__).resolve().parents[1]/'lib'
 sys.path.insert(0,str(LIB))
+sys.path.insert(0,str(LIB.parent/'console'))
 import controller as ctl
 import common
 import formats
 import node as node_worker
+import broker as console_broker
 
 class ControlTests(unittest.TestCase):
  def setUp(self):
@@ -111,6 +113,60 @@ class ControlTests(unittest.TestCase):
   nodes=ctl.assigned_nodes(self.db,ctl.user(self.db,self.uid))
   self.assertEqual(nodes[0]['name'],'港一')
   self.assertEqual(nodes[0]['protocols'],['hysteria2','trojan'])
+ def test_selected_plan_and_user_override_precedence(self):
+  u=ctl.user(self.db,self.uid);n=ctl.node(self.db,self.nid)
+  self.assertTrue(ctl.node_entitlement(self.db,u,n))
+  with self.db:self.db.execute('INSERT INTO plan_access VALUES(?,?)',(self.pid,'selected'))
+  self.assertFalse(ctl.node_entitlement(self.db,u,n))
+  with self.db:self.db.execute('INSERT INTO plan_nodes VALUES(?,?)',(self.pid,self.nid))
+  self.assertTrue(ctl.node_entitlement(self.db,u,n))
+  with self.db:self.db.execute('INSERT INTO user_node_rules VALUES(?,?,?)',(self.uid,self.nid,'deny'))
+  self.assertEqual(ctl.effective(self.db,n),[])
+  with self.db:
+   self.db.execute('DELETE FROM plan_nodes')
+   self.db.execute('UPDATE user_node_rules SET rule="allow"')
+  self.assertEqual(len(ctl.effective(self.db,n)),1)
+  with self.db:self.db.execute('UPDATE nodes SET state="disabled"')
+  self.assertEqual(ctl.effective(self.db,ctl.node(self.db,self.nid)),[])
+ def test_user_allow_cannot_bypass_expiry_quota_or_disabled(self):
+  with self.db:
+   self.db.execute('UPDATE nodes SET tags="[]"')
+   self.db.execute('INSERT INTO user_node_rules VALUES(?,?,?)',(self.uid,self.nid,'allow'))
+  n=ctl.node(self.db,self.nid)
+  self.assertEqual(len(ctl.effective(self.db,n)),1)
+  with self.db:self.db.execute('UPDATE users SET expires=1')
+  self.assertEqual(ctl.effective(self.db,n),[])
+  with self.db:self.db.execute('UPDATE users SET expires=?,upload=quota',(common.now()+1000,))
+  self.assertEqual(ctl.effective(self.db,n),[])
+  with self.db:self.db.execute('UPDATE users SET upload=0,state="disabled"')
+  self.assertEqual(ctl.effective(self.db,n),[])
+ def test_user_node_permission_change_invalidates_publication(self):
+  with self.db:
+   self.db.execute('UPDATE nodes SET revision=?',(ctl.revision(self.db,ctl.node(self.db,self.nid)),))
+   self.db.execute('INSERT INTO grants VALUES(?,?,?)',(self.nid,'m_'+self.uid+'_'+self.cid,json.dumps([{'type':'trojan','tag':'test'}])))
+  ctl.publish(self.db)
+  self.assertEqual(len(json.loads((ctl.PUBLIC_DIR/'published.json').read_text())[0]['outs']),1)
+  with self.db:self.db.execute('INSERT INTO user_node_rules VALUES(?,?,?)',(self.uid,self.nid,'deny'))
+  ctl.publish(self.db)
+  self.assertEqual(json.loads((ctl.PUBLIC_DIR/'published.json').read_text())[0]['outs'],[])
+ def test_console_plan_selection_and_user_edit_are_shared_with_cli(self):
+  before=ctl.user(self.db,self.uid)['quota']
+  with mock.patch.object(ctl,'reconcile') as reconcile:
+   console_broker.operate('plan.edit',{'id':self.pid,'name':'高级','tags':'','quota_gb':'20','days':'60',
+      'price':'100','access_mode':'selected','node_ids':[self.nid]},'test')
+   self.assertEqual(reconcile.call_count,1)
+  self.assertEqual(ctl.user(self.db,self.uid)['quota'],before)
+  self.assertTrue(ctl.node_entitlement(self.db,ctl.user(self.db,self.uid),ctl.node(self.db,self.nid)))
+  with mock.patch.object(ctl,'reconcile'):
+   console_broker.operate('user.edit',{'id':self.uid,'name':'新用户','plan_id':self.pid,'quota_gb':'2.5',
+      'expires':common.now()+5000,'node_rules':{self.nid:'deny'}},'test')
+  self.assertEqual(ctl.user(self.db,self.uid)['quota'],int(2.5*1024**3))
+  self.assertEqual(ctl.effective(self.db,ctl.node(self.db,self.nid)),[])
+  snapshot=console_broker.snapshot()
+  self.assertEqual(snapshot['plans'][0]['access_mode'],'selected')
+  self.assertEqual(snapshot['plans'][0]['node_ids'],[self.nid])
+  self.assertEqual(snapshot['users'][0]['node_rules'],{self.nid:'deny'})
+  self.assertNotIn('token',snapshot['users'][0])
 
 if __name__=='__main__':unittest.main()
 

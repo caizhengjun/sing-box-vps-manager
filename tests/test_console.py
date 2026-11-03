@@ -1,6 +1,7 @@
 """Console security regression tests. Install console/requirements.txt to run HTTP cases."""
 import importlib.util
 import json
+import sqlite3
 from pathlib import Path
 import sys
 import tempfile
@@ -18,6 +19,15 @@ class BrokerTests(unittest.TestCase):
   self.assertEqual(broker.public_host('1.1.1.1'),'1.1.1.1')
  def test_unknown_operation_rejected(self):
   with self.assertRaises(broker.Error):broker.dispatch({'op':'submit','kind':'shell','params':{'command':'whoami'}})
+ def test_invalid_node_ids_rejected(self):
+  d=sqlite3.connect(':memory:')
+  try:
+   d.execute('CREATE TABLE nodes(id TEXT,state TEXT)')
+   d.execute('INSERT INTO nodes VALUES("good","active")')
+   self.assertEqual(broker.validate_node_ids(d,['good','good']),['good'])
+   for value in ('good',['bad'],[1]):
+    with self.assertRaises(broker.Error):broker.validate_node_ids(d,value)
+  finally:d.close()
  def test_no_password_or_task_parameters_persisted(self):
   with tempfile.TemporaryDirectory() as tmp,mock.patch.object(broker,'BASE',Path(tmp)),mock.patch.object(broker,'JOBS') as jobs:
    jobs.full.return_value=False

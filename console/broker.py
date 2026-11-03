@@ -61,13 +61,34 @@ def snapshot():
         d.execute('BEGIN')
         nodes = [{k:r[k] for k in r.keys() if k != 'ssh_key'} for r in d.execute('SELECT * FROM nodes WHERE state!="deleted"')]
         plans = [dict(r) for r in d.execute('SELECT * FROM plans')]
+        for p in plans:
+            policy=d.execute('SELECT mode FROM plan_access WHERE plan_id=?',(p['id'],)).fetchone()
+            p['access_mode']=policy['mode'] if policy else 'tags'
+            p['node_ids']=[r[0] for r in d.execute('SELECT node_id FROM plan_nodes WHERE plan_id=?',(p['id'],))]
+            p['matched_node_ids']=[n['id'] for n in nodes if (n['id'] in p['node_ids'] if p['access_mode']=='selected'
+                                   else bool(set(json.loads(n['tags'])) & set(json.loads(p['tags']))))]
         users = []
         for r in d.execute('SELECT * FROM users WHERE state!="deleted"'):
             u = {k:r[k] for k in r.keys() if k != 'token'}
             u['nodes'] = ctl.assigned_nodes(d,r)
             u['used_display'] = ctl.human_bytes(r['upload']+r['download'])
             u['quota_display'] = '不限流量' if r['is_admin'] else ctl.human_bytes(r['quota'])
+            u['node_rules']={v['node_id']:v['rule'] for v in d.execute('SELECT * FROM user_node_rules WHERE user_id=?',(r['id'],))}
+            eligible=r['state']=='active' and (r['is_admin'] or (r['expires']>now() and r['upload']+r['download']<r['quota']))
+            u['entitled_node_ids']=[n['id'] for n in nodes if ctl.node_entitlement(d,r,n)]
+            u['desired_node_ids']=[n['id'] for n in nodes if eligible and n['state']=='active' and n['stats_ready'] and ctl.node_entitlement(d,r,n)]
             users.append(u)
+        for n in nodes:
+            health=d.execute('SELECT * FROM node_health WHERE node_id=?',(n['id'],)).fetchone()
+            n['health']=json.loads(health['payload']) if health else None
+            n['health_checked']=health['checked'] if health else None
+            n['applied_users']=[{'id':r['id'],'name':r['name'],'state':r['state']} for r in d.execute('''
+              SELECT users.id,users.name,users.state FROM grants JOIN users
+              ON grants.principal='m_'||users.id||'_'||users.cycle WHERE grants.node_id=?''',(n['id'],))]
+            n['assigned_user_count']=len(n['applied_users'])
+            n['desired_user_count']=len(ctl.effective(d,n))
+            n['historical_used_user_count']=d.execute('SELECT COUNT(DISTINCT substr(principal,3,32)) FROM samples WHERE node_id=? AND up+down>0',(n['id'],)).fetchone()[0]
+            n['recorded_traffic']=d.execute('SELECT COALESCE(SUM(up+down),0) FROM samples WHERE node_id=?',(n['id'],)).fetchone()[0]
         return {'nodes':nodes,'plans':plans,'users':users,'server_time':now()}
     finally:d.close()
 
@@ -170,10 +191,31 @@ def operate(kind,p,task):
             elif entity=='plan' and verb in ('add','edit'):
                 quota=int(p['quota_gb'])*1024**3;days=int(p['days'])
                 if not 0<quota<2**60 or not 0<days<=36500:raise Error('额度或天数无效。')
-                values=(label(p['name']),canonical(labels(p['tags'])),quota,days,label(p['price']))
+                values=(label(p['name']),canonical(labels(p.get('tags',''))),quota,days,label(p['price']))
+                mode=p.get('access_mode','tags')
+                if mode not in ('tags','selected'):raise Error('节点分配模式无效。')
+                selected=validate_node_ids(d,p.get('node_ids',[]))
+                pid=uid() if verb=='add' else ctl.plan(d,args.id)['id']
                 with d:
-                    if verb=='add':d.execute('INSERT INTO plans VALUES(?,?,?,?,?,?)',(uid(),)+values)
-                    else:d.execute('UPDATE plans SET name=?,tags=?,quota=?,days=?,price=? WHERE id=?',values+(ctl.plan(d,args.id)['id'],))
+                    if verb=='add':d.execute('INSERT INTO plans VALUES(?,?,?,?,?,?)',(pid,)+values)
+                    else:d.execute('UPDATE plans SET name=?,tags=?,quota=?,days=?,price=? WHERE id=?',values+(pid,))
+                    if 'access_mode' in p or verb=='add':
+                        d.execute('INSERT OR REPLACE INTO plan_access VALUES(?,?)',(pid,mode))
+                        d.execute('DELETE FROM plan_nodes WHERE plan_id=?',(pid,))
+                        d.executemany('INSERT INTO plan_nodes VALUES(?,?)',[(pid,nid) for nid in selected])
+                ctl.reconcile(d)
+            elif entity=='user' and verb=='edit':
+                u=ctl.user(d,args.id);plan=ctl.plan(d,p['plan_id']);name=label(p['name'])
+                quota=0 if u['is_admin'] else int(float(p['quota_gb'])*1024**3)
+                expires=0 if u['is_admin'] else int(p['expires'])
+                if not u['is_admin'] and (not 0<quota<2**60 or expires<=u['started']):raise Error('流量额度或结束时间无效。')
+                rules=p.get('node_rules',{})
+                if not isinstance(rules,dict) or any(v not in ('allow','deny') for v in rules.values()):raise Error('用户节点规则无效。')
+                validate_node_ids(d,list(rules))
+                with d:
+                    d.execute('UPDATE users SET name=?,plan_id=?,quota=?,expires=? WHERE id=?',(name,plan['id'],quota,expires,u['id']))
+                    d.execute('DELETE FROM user_node_rules WHERE user_id=?',(u['id'],))
+                    d.executemany('INSERT INTO user_node_rules VALUES(?,?,?)',[(u['id'],nid,rule) for nid,rule in rules.items()])
                 ctl.reconcile(d)
             elif entity=='user' and verb in ('add','add-admin','renew','disable','enable','delete','rotate-token'):
                 # Adapt the existing fixed CLI prompts; one sequential worker only.
@@ -191,8 +233,14 @@ def operate(kind,p,task):
             else:raise Error('不支持的操作。')
         finally:d.close()
 
+def validate_node_ids(d,values):
+    if not isinstance(values,list) or len(values)>1000 or any(not isinstance(v,str) for v in values):raise Error('节点列表无效。')
+    valid={r[0] for r in d.execute('SELECT id FROM nodes WHERE state!="deleted"')}
+    if not set(values)<=valid:raise Error('选中的节点已删除或不存在，请刷新页面。')
+    return sorted(set(values))
+
 KINDS={'reconcile','node.initialise','node.enable','node.disable','node.delete','node.sync','node.sni','node.edit',
-       'plan.add','plan.edit','user.add','user.add-admin','user.renew','user.disable','user.enable','user.delete','user.rotate-token'}
+       'plan.add','plan.edit','user.add','user.add-admin','user.edit','user.renew','user.disable','user.enable','user.delete','user.rotate-token'}
 
 def worker():
     while True:
