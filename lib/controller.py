@@ -419,7 +419,7 @@ def user_cmd(d,args):
             print('高清 PNG 已保存：'+args.output)
 
 
-def menu(d):
+def menu():
     choices={
       '1':('node','list'),'2':('node','add'),'3':('node','show'),'4':('node','edit'),
       '5':('node','sync'),'6':('node','disable'),'7':('node','enable'),'8':('node','delete'),
@@ -435,14 +435,23 @@ def menu(d):
         print('21 全部对账  0 退出')
         choice=input('选择：').strip()
         if choice=='0':return
-        if choice=='21':reconcile(d);continue
+        if choice=='21':
+            with lock(HOME/'lock'):
+                d=database()
+                try:reconcile(d)
+                finally:d.close()
+            continue
         if choice not in choices:print('无效选择');continue
         kind,action=choices[choice]
         needs_id=action not in ('list','add','add-admin')
         item=ask('节点 ID' if kind=='node' else '套餐/用户 ID 或名称') if needs_id else None
         a=argparse.Namespace(action=action,id=item,format='singbox',output=None)
         if action=='qr':a.format=ask('订阅格式 singbox/mihomo/base64/links','singbox')
-        try:{'node':node_cmd,'plan':plan_cmd,'user':user_cmd}[kind](d,a)
+        try:
+            with lock(HOME/'lock'):
+                d=database()
+                try:{'node':node_cmd,'plan':plan_cmd,'user':user_cmd}[kind](d,a)
+                finally:d.close()
         except (Error,ValueError,sqlite3.Error) as e:print('错误：'+str(e))
 
 def main():
@@ -461,6 +470,8 @@ def main():
             if act=='qr':q.add_argument('--format',choices=['singbox','mihomo','base64','links'],default='singbox');q.add_argument('--output')
     sub.add_parser('reconcile');setup=sub.add_parser('setup');setup.add_argument('--domain',required=True)
     args=parser.parse_args()
+    if args.kind is None:
+        menu();return
     with lock(HOME/'lock'):
         d=database()
         try:
@@ -471,7 +482,7 @@ def main():
             elif args.kind=='plan':plan_cmd(d,args)
             elif args.kind=='user':user_cmd(d,args)
             elif args.kind=='reconcile':reconcile(d)
-            else:menu(d)
+            else:raise Error('缺少管理命令。')
         finally:d.close()
 
 if __name__=='__main__':
