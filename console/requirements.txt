@@ -1,0 +1,8 @@
+fastapi>=0.115,<1
+uvicorn>=0.34,<1
+argon2-cffi>=23.1,<26
+pyotp>=2.9,<3
+PyJWT[crypto]>=2.10,<3
+paramiko>=3.5,<5
+qrcode[pil]>=8,<9
+httpx>=0.28,<1
