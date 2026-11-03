@@ -39,13 +39,23 @@ def outbounds(config, domain, node_name, username, principal, cred):
         result.append(o)
     return result
 
-def singbox(outs):
+def singbox(outs, gui=False):
     names = [o['tag'] for o in outs]
     # Full runnable local SOCKS/HTTP client, loopback only, no open proxy.
-    return {'log': {'level': 'warn'},
+    config = {'log': {'level': 'info', 'timestamp': True},
             'inbounds': [{'type': 'mixed', 'tag': 'local', 'listen': '127.0.0.1', 'listen_port': 1080}],
             'outbounds': [{'type': 'selector', 'tag': '套餐节点', 'outbounds': names}] + copy.deepcopy(outs),
             'route': {'final': '套餐节点'}}
+    if gui:
+        config['inbounds'] = [{'type':'tun','tag':'tun-in','address':['172.19.0.1/30'],
+                               'mtu':1500,'auto_route':True,'stack':'gvisor'}]
+        config['dns'] = {'servers':[
+            {'type':'udp','tag':'bootstrap','server':'223.5.5.5'},
+            {'type':'https','tag':'remote','server':'1.1.1.1','path':'/dns-query','detour':'套餐节点'}],
+            'final':'remote','strategy':'ipv4_only'}
+        config['route'].update(auto_detect_interface=True,default_domain_resolver='bootstrap',
+            rules=[{'port':53,'action':'hijack-dns'}])
+    return config
 
 def mihomo_proxy(o):
     if o['type'] == 'naive': return None
@@ -108,7 +118,7 @@ def render(outs, fmt):
     # available as a separately verified service for clients that ship it.
     if fmt=='singbox':
         portable=[o for o in outs if o['type'] in ('vless','trojan','hysteria2','tuic','shadowsocks')]
-        return json.dumps(singbox(portable),ensure_ascii=False,indent=2)+'\n','application/json'
+        return json.dumps(singbox(portable,gui=True),ensure_ascii=False,indent=2)+'\n','application/json'
     if fmt=='karing':
         return json.dumps(singbox(outs),ensure_ascii=False,indent=2)+'\n','application/json'
     if fmt=='mihomo':

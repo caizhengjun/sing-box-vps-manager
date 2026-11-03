@@ -94,6 +94,12 @@ class ControlTests(unittest.TestCase):
   self.assertEqual([o['type'] for o in portable['outbounds'][1:]],['vless','trojan','hysteria2','tuic','shadowsocks'])
   self.assertEqual(full['outbounds'][1:],outs)
   self.assertEqual(full['outbounds'][0]['outbounds'],[o['tag'] for o in outs])
+  self.assertEqual(portable['inbounds'][0]['type'],'tun')
+  self.assertTrue(portable['inbounds'][0]['auto_route'])
+  self.assertEqual(portable['log']['level'],'info')
+  self.assertEqual(portable['dns']['final'],'remote')
+  self.assertEqual(portable['route']['default_domain_resolver'],'bootstrap')
+  self.assertEqual(full['inbounds'][0]['type'],'mixed')
  def test_human_readable_user_details_and_assigned_node(self):
   self.assertEqual(ctl.human_bytes(341944499),'326.10 MB')
   self.assertEqual(ctl.human_bytes(2*1024**3),'2.00 GB')
