@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Administrator control plane. Keeps secrets in a root-only SQLite database."""
 import argparse
+from datetime import datetime
 import getpass
 import hashlib
 import json
@@ -78,6 +79,38 @@ def user(d,who):
 
 def subscription_base(d,u):
     return 'https://'+data(d,'subscription_domain')+('/admin/' if u['is_admin'] else '/sub/')+u['token']
+
+def human_bytes(value):
+    value=max(0,int(value))
+    if value >= 1024**3:return f'{value/1024**3:.2f} GB'
+    return f'{value/1024**2:.2f} MB'
+
+def human_time(value):
+    return '永久' if not value else datetime.fromtimestamp(int(value)).astimezone().strftime('%Y-%m-%d %H:%M')
+
+def assigned_nodes(d,u):
+    principal='m_'+u['id']+'_'+u['cycle']
+    result=[]
+    for r in d.execute('''SELECT nodes.name,nodes.domain,nodes.state,nodes.status,grants.outs
+                          FROM grants JOIN nodes ON nodes.id=grants.node_id
+                          WHERE grants.principal=? AND nodes.state!="deleted"
+                          ORDER BY nodes.name''',(principal,)):
+        protocols=sorted({o.get('type','?') for o in json.loads(r['outs'])})
+        result.append({'name':r['name'],'domain':r['domain'],'state':r['state'],
+                       'status':r['status'],'protocols':protocols})
+    return result
+
+def print_user(d,u,include_id=True):
+    if include_id:print('ID：'+u['id'])
+    print('用户：'+u['name']+'　状态：'+u['state']+('　类型：管理员' if u['is_admin'] else ''))
+    print('时间：'+human_time(u['started'])+' → '+human_time(u['expires']))
+    used=human_bytes(u['upload']+u['download'])
+    print('流量：'+used+' / '+('不限流量' if u['is_admin'] else human_bytes(u['quota'])))
+    nodes=assigned_nodes(d,u)
+    if not nodes:print('节点：尚未同步到任何节点')
+    for n in nodes:
+        suffix='' if n['state']=='active' else ' ['+n['state']+'，'+str(n['status'])+']'
+        print('节点：'+n['name']+' ('+n['domain']+')　协议：'+(', '.join(n['protocols']) or '无')+suffix)
 
 def effective(d,n):
     tags=set(json.loads(n['tags']))
@@ -336,8 +369,11 @@ def plan_cmd(d,args):
 
 def user_cmd(d,args):
     if args.action=='list':
-        for u in d.execute('SELECT * FROM users'):
-            print(u['id'],u['name'],u['state'],'已用',u['upload']+u['download'],'/',u['quota'],'到期',u['expires'])
+        rows=list(d.execute('SELECT * FROM users ORDER BY name'))
+        if not rows:print('暂无用户。')
+        for index,u in enumerate(rows):
+            if index:print('─'*48)
+            print_user(d,u)
         return
     if args.action in ('add','add-admin'):
         name=label(ask('用户名'));p=plan(d,ask('套餐名称或 ID'));ts=now();user_id=uid()
@@ -352,8 +388,9 @@ def user_cmd(d,args):
         reconcile(d);print('用户 ID：'+user_id);return
     u=user(d,args.id)
     if args.action=='show':
-        print(canonical({k:u[k] for k in u.keys() if k!='token'}))
+        print_user(d,u)
         base=subscription_base(d,u)
+        print('订阅：')
         for fmt in ('singbox','mihomo','base64','links'):print(fmt,base+'?format='+fmt)
     elif args.action=='renew':
         if u['is_admin']:raise Error('管理员订阅无需续费。')
@@ -374,10 +411,12 @@ def user_cmd(d,args):
     elif args.action=='qr':
         if args.format not in ('singbox','mihomo','base64','links'):raise Error('二维码订阅格式无效。')
         base=subscription_base(d,u)+'?format='+args.format
-        subprocess.run(['qrencode','-t','ANSIUTF8'],input=base.encode(),check=True)
+        print('\n紧凑二维码（请扩大终端窗口后扫描）：')
+        subprocess.run(['qrencode','-t','UTF8','-m','1'],input=base.encode(),check=True)
         if args.output:
-            run(['qrencode','-o',args.output],base.encode())
+            run(['qrencode','-s','8','-m','4','-o',args.output],base.encode())
             os.chmod(args.output,0o600)
+            print('高清 PNG 已保存：'+args.output)
 
 
 def menu(d):

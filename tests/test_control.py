@@ -87,6 +87,16 @@ class ControlTests(unittest.TestCase):
   with mock.patch.object(ctl,'ask',side_effect=lambda *a,**k:next(answers)),mock.patch.object(ctl,'reconcile'):
    ctl.edit_node(self.db,ctl.node(self.db,self.nid))
   self.assertIsNone(ctl.node(self.db,self.nid)['revision'])
+ def test_human_readable_user_details_and_assigned_node(self):
+  self.assertEqual(ctl.human_bytes(341944499),'326.10 MB')
+  self.assertEqual(ctl.human_bytes(2*1024**3),'2.00 GB')
+  self.assertEqual(ctl.human_time(0),'永久')
+  principal='m_'+self.uid+'_'+self.cid
+  with self.db:self.db.execute('INSERT INTO grants VALUES(?,?,?)',(self.nid,principal,json.dumps([
+      {'type':'trojan'},{'type':'hysteria2'}])))
+  nodes=ctl.assigned_nodes(self.db,ctl.user(self.db,self.uid))
+  self.assertEqual(nodes[0]['name'],'港一')
+  self.assertEqual(nodes[0]['protocols'],['hysteria2','trojan'])
 
 if __name__=='__main__':unittest.main()
 
